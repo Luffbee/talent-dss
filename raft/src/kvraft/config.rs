@@ -12,7 +12,7 @@ use crate::kvraft::{
 };
 use crate::raft;
 use crate::raft::persister::*;
-use rand::Rng;
+use rand::seq::SliceRandom;
 
 static ID: AtomicUsize = AtomicUsize::new(300_000);
 
@@ -204,7 +204,7 @@ impl Config {
             self.net.connect(&name, &format!("{}", j));
         }
 
-        rand::thread_rng().shuffle(&mut ends);
+        ends.shuffle(&mut rand::thread_rng());
         let ck_name = uniqstring();
         let ck = client::Clerk::new(ck_name.clone(), ends);
         self.clerks.lock().unwrap().insert(ck_name, endnames);

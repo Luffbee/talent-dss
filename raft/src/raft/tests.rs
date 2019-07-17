@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::sync::oneshot;
 use futures::{future, Future};
-use rand::{Rng, ThreadRng};
+use rand::{Rng, rngs::ThreadRng};
 
 use crate::raft::config::{Config, Entry, Storage};
 use crate::raft::Node;

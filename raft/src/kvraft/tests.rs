@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures::sync::oneshot;
 use futures::{future, Future};
 use futures_timer::Delay;
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 
 use crate::kvraft::client::Clerk;
 use crate::kvraft::config::Config;
@@ -159,7 +159,7 @@ fn partitioner(
         let mut rng = rand::thread_rng();
         while done.load(Ordering::Relaxed) == 0 {
             if !is_parked {
-                rng.shuffle(&mut all);
+                all.shuffle(&mut rng);
                 let offset = rng.gen_range(0, cfg.n);
                 cfg.partition(&all[..offset], &all[offset..]);
                 sleep = Some(delay(rng.gen::<u64>()));

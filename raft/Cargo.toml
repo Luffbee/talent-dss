@@ -18,10 +18,11 @@ linearizability = { path = "../linearizability"}
 prost = "0.5"
 prost-derive = "0.5"
 bytes = "0.4.7"
-rand = "0.4"
+rand = "0.7"
 log = "0.4"
 futures = "0.1"
 futures-timer = "0.1"
+tokio = "0.1.22"
 
 [dev-dependencies]
 env_logger = "0.6"
