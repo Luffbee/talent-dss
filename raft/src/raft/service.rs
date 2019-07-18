@@ -63,6 +63,23 @@ pub struct AppendEntriesArgs {
 pub struct AppendEntriesReply {
     #[prost(uint64, tag=1)]
     pub term: u64,
-    #[prost(bool)]
-    pub success: bool,
+    #[prost(message)]
+    pub conflict: Option<EntryConflict>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EntryConflict {
+    #[prost(uint64, tag=1)]
+    pub log_index: u64,
+    #[prost(uint64)]
+    pub log_term: u64,
+}
+
+impl EntryConflict {
+    pub fn new(idx: usize, term: u64) -> EntryConflict {
+        EntryConflict {
+            log_index: idx as u64,
+            log_term: term,
+        }
+    }
 }

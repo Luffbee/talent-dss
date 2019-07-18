@@ -1,11 +1,11 @@
 use std::cmp::{max, min};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use futures::prelude::*;
-use futures::stream::{futures_unordered};
+use futures::stream::futures_unordered;
 use futures::sync::mpsc::{self, UnboundedReceiver as RX, UnboundedSender as TX};
 use futures::sync::oneshot;
 use futures_timer::Delay;
@@ -57,11 +57,12 @@ enum Role {
     Follower,
 }
 
-const ELECTION_TIMEOUT: std::ops::Range<u64> = 300..500;
-const HEARTBEAT_TIMEOUT: u64 = 100;
+const ELECTION_TIMEOUT: std::ops::Range<u64> = 650..800;
+const HEARTBEAT_TIMEOUT: u64 = 300;
 
 // A single Raft peer.
 pub struct Raft {
+    apply_ch: TX<ApplyMsg>,
     // RPC end points of all peers
     peers: Vec<RaftClient>,
     // Object to hold this peer's persisted state
@@ -77,6 +78,7 @@ pub struct Raft {
     // volatile state on all servers
     commit_index: usize,
     last_applied: usize,
+    applying: bool,
     // volatile state on leader
     next_index: Vec<usize>,
     match_index: Vec<usize>,
@@ -85,8 +87,8 @@ pub struct Raft {
     rx: Option<RX<ActionEv>>,
 }
 
-use self::Event::*;
 use self::ActionEv::*;
+use self::Event::*;
 use self::TimeoutEv::*;
 
 impl Raft {
@@ -114,6 +116,7 @@ impl Raft {
 
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
+            apply_ch,
             peers,
             persister,
             me,
@@ -124,6 +127,7 @@ impl Raft {
             log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
+            applying: false,
             next_index,
             match_index,
             tx,
@@ -202,8 +206,10 @@ impl Raft {
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != me)
-            .map(|(i, peer)| peer.request_vote(&args)
-                 .map_err(move |e| (me, i, Error::Rpc(e))))
+            .map(|(i, peer)| {
+                peer.request_vote(&args)
+                    .map_err(move |e| (me, i, Error::Rpc(e)))
+            })
             .collect();
 
         let stream = futures_unordered(reqs);
@@ -238,11 +244,14 @@ impl Raft {
         let next_idx = self.next_index[id];
         let match_idx = self.match_index[id];
         let pre_idx = next_idx - 1;
-        let pre_term = self.log.get(pre_idx).map_or(0, |entry| entry.term);
+        let mut pre_term = 0;
+        if pre_idx > 0 {
+            pre_term = self.log[pre_idx-1].term
+        }
         let entries = if next_idx > match_idx + 1 {
             Vec::new()
         } else {
-            Vec::from(&self.log[next_idx-1..])
+            Vec::from(&self.log[next_idx - 1..])
         };
         AppendEntriesArgs {
             term: self.current_term.load(Ordering::SeqCst),
@@ -278,17 +287,24 @@ impl Raft {
             stream
                 .map_err(|(me, id, e)| error!("{} -> {} AppendEntries RPC error: {}", me, id, e))
                 .for_each(move |(rep, id, pre_idx, len)| {
-                    if rep.success {
-                        // if success, return (term, id, match index)
-                        Self::report_event(
-                            tx.clone(),
-                            UpdatePeer(term, id, Ok(pre_idx as usize + len)),
-                        )
-                    } else if rep.term > term {
-                        Self::report_event(tx.clone(), FoundNewTerm(rep.term));
-                    } else {
-                        // if failed, return (term, id, prev index)
-                        Self::report_event(tx.clone(), UpdatePeer(term, id, Err(pre_idx as usize)))
+                    match rep.conflict {
+                        None => {
+                            // if success, return (term, id, match index)
+                            Self::report_event(
+                                tx.clone(),
+                                UpdatePeer(term, id, Ok(pre_idx as usize + len)),
+                            )
+                        }
+                        Some(conflict) => {
+                            if rep.term > term {
+                                Self::report_event(tx.clone(), FoundNewTerm(rep.term));
+                            } else {
+                                // if failed, return (term, id, next index)
+                                // TODO
+                                let nxt_idx = conflict.log_index as usize;
+                                Self::report_event(tx.clone(), UpdatePeer(term, id, Err(nxt_idx)))
+                            }
+                        }
                     }
                     Ok(())
                 }),
@@ -327,11 +343,15 @@ impl Raft {
         let log_index = args.last_log_index;
 
         let term = self.current_term.load(Ordering::SeqCst);
-        let vote_granted = if args.term > term {
-            self.current_term.store(args.term, Ordering::SeqCst);
-            true
-        } else if args.term < term || self.is_newer(log_term, log_index) {
+
+        if args.term > term {
+                self.current_term.store(args.term, Ordering::SeqCst);
+        }
+
+        let vote_granted = if args.term < term || self.is_newer(log_term, log_index) {
             false
+        } else if args.term > term {
+            true
         } else {
             match self.voted_for {
                 Some(id) => id == args.candidate_id as usize,
@@ -346,13 +366,27 @@ impl Raft {
         RequestVoteReply { term, vote_granted }
     }
 
-    fn is_conflict(&self, pre_index: usize, pre_term: u64) -> bool {
+    fn is_conflict(&self, pre_index: usize, pre_term: u64) -> Option<EntryConflict> {
         if pre_index == 0 {
-            pre_term != 0
+            if pre_term != 0 {
+                Some(EntryConflict::new(0, 0))
+            } else {
+                None
+            }
         } else {
             match self.log.get(pre_index - 1) {
-                None => true,
-                Some(entry) => entry.term != pre_term,
+                None => Some(EntryConflict::new(self.log.len()+1, 0)),
+                Some(entry) => if entry.term != pre_term {
+                    let mut idx = 1;
+                    for i in (0..pre_index-1).rev() {
+                        if self.log[i].term != entry.term {
+                            idx = i + 2;
+                        }
+                    }
+                    Some(EntryConflict::new(idx, entry.term))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -362,22 +396,30 @@ impl Raft {
         let pre_term = args.prev_log_term;
 
         let term = self.current_term.load(Ordering::SeqCst);
-        let success = args.term >= term && !self.is_conflict(pre_idx, pre_term);
+        let conflict = if args.term < term {
+            Some(EntryConflict::new(0, 0))
+        } else {
+            self.is_conflict(pre_idx, pre_term)
+        };
 
-        if success {
+        if conflict.is_none() {
             if args.term > term {
                 self.current_term.store(args.term, Ordering::SeqCst);
             }
             if let Some(entry) = args.entries.last() {
                 // truncate and move if the last is conflict
-                if self.is_conflict(entry.index as usize, entry.term) {
+                // TODO
+                if self.is_conflict(entry.index as usize, entry.term).is_some() {
                     self.log.truncate(pre_idx);
                     self.log.append(&mut args.entries);
                 }
             }
+            if args.leader_commit > self.commit_index as u64 {
+                self.commit_index = min(args.leader_commit as usize, pre_idx + args.entries.len());
+            }
         }
 
-        AppendEntriesReply { term, success }
+        AppendEntriesReply { term, conflict }
     }
 
     fn become_leader(&mut self) {
@@ -403,17 +445,68 @@ impl Raft {
         self.role = Role::Follower;
     }
 
+    fn update_commit(&mut self, idx: usize) {
+        if idx <= self.commit_index {
+            return;
+        }
+        let term = self.log[idx - 1].term;
+        if term == self.current_term.load(Ordering::SeqCst) {
+            let sz = self.peers.len();
+            let mut cnt = 1;
+            let mut update = false;
+            for i in 0..sz {
+                if i != self.me && self.match_index[i] >= idx {
+                    cnt += 1;
+                    if cnt + cnt > sz {
+                        update = true;
+                        break;
+                    }
+                }
+            }
+            if update {
+                self.commit_index = idx;
+                self.apply_entry();
+            }
+        }
+    }
+
+    fn apply_entry(&mut self) {
+        if self.commit_index <= self.last_applied || self.applying {
+            return;
+        }
+        self.applying = true;
+        let apply_idx = self.last_applied + 1;
+        let msg = ApplyMsg {
+            command_valid: true,
+            command: self.log[apply_idx - 1].command.clone(),
+            command_index: apply_idx as u64,
+        };
+        let ch = self.apply_ch.clone();
+        let tx = self.tx.clone();
+        let err_tx = tx.clone();
+        spawn(
+            ch.send(msg)
+                .map(move |_| {
+                    Self::report_event(tx, ApplySuccess);
+                })
+                .or_else(move |e| {
+                    error!("apply entry failed: {}", e);
+                    let delay = Delay::new(Duration::from_millis(70));
+                    delay.map(|_| Self::report_event(err_tx, ApplyFailed)).map_err(|_| ())
+                }),
+        );
+    }
+
     /// recursively spawn serve_loop
-    fn serve_proc(
-        mut self,
-    ) -> impl FnMut(Event) -> ProcResult + Send + 'static {
+    fn serve_proc(mut self) -> impl FnMut(Event) -> ProcResult + Send + 'static {
         move |ev| {
             use self::ProcResult::*;
             match ev {
                 Action(RequestVote(args, tx)) => {
-                    info!("{} handling RequestVote RPC: {:?}", self.me, args);
+                    debug!("{} handling RequestVote RPC: {:?}", self.me, args);
                     let rep = self.handle_request_vote(args);
                     let ok = rep.vote_granted;
+                    debug!("{} reply for RequestVote RPC: {:?}", self.me, rep);
                     tx.send(rep)
                         .unwrap_or_else(|rep| error!("failed to send reply: {:?}", rep));
                     if ok {
@@ -426,12 +519,14 @@ impl Raft {
                 }
                 Action(AppendEntries(args, tx)) => {
                     let args_term = args.term;
-                    info!("{} handling AppendEntries RPC: {:?}", self.me, args);
+                    debug!("{} handling AppendEntries RPC: {:?}", self.me, args);
                     let rep = self.handle_append_entries(args);
                     let ok = rep.term <= args_term;
+                    debug!("{} reply for AppendEntries RPC: {:?}", self.me, rep);
                     tx.send(rep)
                         .unwrap_or_else(|rep| error!("failed to send reply: {:?}", rep));
                     if ok {
+                        self.apply_entry();
                         self.become_follower();
                         let dur = self.election_timeout();
                         UpdateTimeout(dur, Election)
@@ -466,6 +561,7 @@ impl Raft {
                                 let match_idx = max(self.match_index[id], match_idx);
                                 self.match_index[id] = match_idx;
                                 self.next_index[id] = match_idx + 1;
+                                self.update_commit(match_idx);
                             }
                             Err(pre_idx) => {
                                 self.next_index[id] = max(1, min(self.next_index[id], pre_idx));
@@ -475,6 +571,26 @@ impl Raft {
                         info!("late BecomeLeader for term: {}", term);
                     }
                     ProcResult::GoOn
+                }
+                Action(NewEntry(cmd, tx)) => {
+                    debug!("{} handling NewEntry: {:?}", self.me, cmd);
+                    let res = self.start(cmd);
+                    tx.send(res)
+                        .unwrap_or_else(|res| error!("failed to send NewEntry reply: {:?}", res));
+                    GoOn
+                }
+                Action(ApplySuccess) => {
+                    self.last_applied += 1;
+                    debug!("{} applying entry {} succeeded", self.me, self.last_applied);
+                    self.applying = false;
+                    self.apply_entry();
+                    GoOn
+                }
+                Action(ApplyFailed) => {
+                    warn!("{} applying entry {} failed", self.me, self.last_applied);
+                    self.applying = false;
+                    self.apply_entry();
+                    GoOn
                 }
                 Action(Killed) => {
                     warn!("{} receive killed", self.me);
@@ -498,39 +614,31 @@ impl Raft {
     /// wait for RPCs
     /// if timeout become candidate
     fn serve(mut self) -> impl Future<Item = (), Error = ()> {
-        futures::future::FutureResult::from(Ok(()))
-            .map(|_| {
-                if let Some(rx) = self.rx.take() {
-                    let timeout = self.election_timeout();
-                    let evloop = EventLoopFuture::new(
-                        rx,
-                        timeout,
-                        TimeoutEv::Election,
-                        self.serve_proc(),
-                        );
-                    spawn(evloop);
-                } else {
-                    warn!("serve twice won't do anything")
-                }
-            })
+        futures::future::FutureResult::from(Ok(())).map(|_| {
+            if let Some(rx) = self.rx.take() {
+                let timeout = self.election_timeout();
+                let evloop =
+                    EventLoopFuture::new(rx, timeout, TimeoutEv::Election, self.serve_proc());
+                spawn(evloop);
+            } else {
+                warn!("serve twice won't do anything")
+            }
+        })
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        let index = 0;
-        let term = 0;
-        let is_leader = self.is_leader.load(Ordering::Relaxed);
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+    fn start(&mut self, command: Vec<u8>) -> Result<(u64, u64)> {
+        if !self.is_leader.load(Ordering::SeqCst) {
+            return Err(Error::NotLeader);
         }
+        let index = 1 + self.log.len() as u64;
+        let term = self.current_term.load(Ordering::SeqCst);
+        let entry = Entry {
+            term,
+            index,
+            command,
+        };
+        self.log.push(entry);
+        Ok((index, term))
     }
 }
 
@@ -564,7 +672,12 @@ impl Node {
         let is_leader = raft.is_leader.clone();
         let handle = Some(thread::spawn(|| tokio::run(raft.serve())));
         let handle = Arc::new(Mutex::new(handle));
-        Node { tx, term, is_leader, handle }
+        Node {
+            tx,
+            term,
+            is_leader,
+            handle,
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -579,14 +692,29 @@ impl Node {
     /// at if it's ever committed. the second is the current term.
     ///
     /// This method must return without blocking on the raft.
-    pub fn start<M>(&self, _command: &M) -> Result<(u64, u64)>
+    pub fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        unimplemented!()
+        if !self.is_leader() {
+            return Err(Error::NotLeader);
+        }
+
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.send(NewEntry(buf, tx)) {
+            error!("failed to send NewEntry: {}", e);
+            return Err(Error::NotLeader);
+        }
+        match rx.wait() {
+            Ok(res) => res,
+            Err(e) => {
+                error!("failed to receive NewEntry reply: {}", e);
+                Err(Error::NotLeader)
+            }
+        }
     }
 
     /// The current term of this peer.
@@ -641,32 +769,40 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         let (tx, rx) = oneshot::channel();
-        Box::new(self.tx.clone().send(RequestVote(args, tx))
-            .map_err(|e| {
-                let err = format!("failed to send RequestVote to raft: {}", e);
-                labrpc::Error::Other(err)
-            })
-            .and_then(move |_| {
-                rx.map_err(|_| {
-                    let err = "failed to receive RequestVoteReply from raft".to_string();
+        Box::new(
+            self.tx
+                .clone()
+                .send(RequestVote(args, tx))
+                .map_err(|e| {
+                    let err = format!("failed to send RequestVote to raft: {}", e);
                     labrpc::Error::Other(err)
                 })
-            }))
+                .and_then(move |_| {
+                    rx.map_err(|_| {
+                        let err = "failed to receive RequestVoteReply from raft".to_string();
+                        labrpc::Error::Other(err)
+                    })
+                }),
+        )
     }
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         let (tx, rx) = oneshot::channel();
-        Box::new(self.tx.clone().send(AppendEntries(args, tx))
-            .map_err(|e| {
-                let err = format!("failed to send AppendEntries to raft: {}", e);
-                labrpc::Error::Other(err)
-            })
-            .and_then(move |_| {
-                rx.map_err(|_| {
-                    let err = "failed to receive AppendEntriesReply from raft".to_string();
+        Box::new(
+            self.tx
+                .clone()
+                .send(AppendEntries(args, tx))
+                .map_err(|e| {
+                    let err = format!("failed to send AppendEntries to raft: {}", e);
                     labrpc::Error::Other(err)
                 })
-            }))
+                .and_then(move |_| {
+                    rx.map_err(|_| {
+                        let err = "failed to receive AppendEntriesReply from raft".to_string();
+                        labrpc::Error::Other(err)
+                    })
+                }),
+        )
     }
 }
 
@@ -683,6 +819,9 @@ enum ActionEv {
     FoundNewTerm(u64),
     BecomeLeader(u64),
     UpdatePeer(u64, usize, std::result::Result<usize, usize>),
+    NewEntry(Vec<u8>, oneshot::Sender<Result<(u64, u64)>>),
+    ApplySuccess,
+    ApplyFailed,
     Killed,
 }
 
@@ -700,7 +839,7 @@ enum ProcResult {
 
 struct EventLoopFuture<F>
 where
-    F: FnMut(Event) -> ProcResult + Send + 'static
+    F: FnMut(Event) -> ProcResult + Send + 'static,
 {
     rx: RX<ActionEv>,
     default_dur: Duration,
@@ -712,19 +851,31 @@ where
 
 impl<F> EventLoopFuture<F>
 where
-    F: FnMut(Event) -> ProcResult + Send + 'static
+    F: FnMut(Event) -> ProcResult + Send + 'static,
 {
-    fn new(rx: RX<ActionEv>, timeout: Duration, timeout_ev: TimeoutEv, proc: F) -> EventLoopFuture<F> {
+    fn new(
+        rx: RX<ActionEv>,
+        timeout: Duration,
+        timeout_ev: TimeoutEv,
+        proc: F,
+    ) -> EventLoopFuture<F> {
         let default_dur = timeout;
         let timeout = Delay::new(timeout);
 
-        EventLoopFuture { rx, default_dur, timeout, timeout_ev, proc, running: true}
+        EventLoopFuture {
+            rx,
+            default_dur,
+            timeout,
+            timeout_ev,
+            proc,
+            running: true,
+        }
     }
 }
 
 impl<F> Future for EventLoopFuture<F>
 where
-    F: FnMut(Event) -> ProcResult + Send + 'static
+    F: FnMut(Event) -> ProcResult + Send + 'static,
 {
     type Item = ();
     type Error = ();
@@ -768,14 +919,14 @@ where
                             self.running = false;
                         }
                     }
-                },
+                }
                 Ok(Async::NotReady) => {
                     return Ok(Async::NotReady);
-                },
+                }
                 Err(e) => {
                     error!("timeout error: {}", e);
                     self.timeout = Delay::new(self.default_dur);
-                },
+                }
             }
         }
         info!("event loop end");
